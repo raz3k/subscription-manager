@@ -27,6 +27,7 @@
 #include <time.h>
 #include <string.h>
 #include <errno.h>
+#include <zlib.h>
 
 #include "util.h"
 #include "product-id.h"
@@ -237,17 +238,6 @@ int pluginHook(PluginHandle *handle, PluginHookId id, DnfPluginHookData *hookDat
 
     debug("%s v%s, running hook_id: %s on DNF version %d",
             pinfo.name, pinfo.version, strHookId(id), handle->version);
-
-    if (id == PLUGIN_HOOK_ID_CONTEXT_CONF) {
-        // Get DNF context
-        DnfContext *dnfContext = handle->context;
-        if (dnfContext == NULL) {
-            error("Unable to get dnf context");
-            return 1;
-        }
-
-        requestProductIdMetadata(dnfContext);
-    }
 
     if (id == PLUGIN_HOOK_ID_CONTEXT_TRANSACTION) {
         // Get DNF context
@@ -545,6 +535,120 @@ void getActive(DnfPluginHookData *hookData, const GPtrArray *repoAndProductIds, 
 }
 
 
+static void copy_lr_val(LrVar *lr_val, LrUrlVars **newVarSubst) {
+    *newVarSubst = lr_urlvars_set(*newVarSubst, lr_val->var, lr_val->val);
+}
+
+int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
+    int ret = 0;
+    GError *tmp_err = NULL;
+    LrHandle *lrHandle = dnf_repo_get_lr_handle(repo);
+    LrResult *lrResult = dnf_repo_get_lr_result(repo);
+
+    // getinfo uses the LRI* constants while setopt uses LRO*
+    char *destdir;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_DESTDIR, &destdir);
+    if (tmp_err) {
+        printError("Unable to get information about destination folder", tmp_err);
+    } else {
+        if (destdir) {
+            debug("Destination folder: %s", destdir);
+        } else {
+            error("Destination folder not set");
+        }
+    }
+
+    char **urls = NULL;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_URLS, &urls);
+    if (tmp_err) {
+        printError("Unable to get information about URLs", tmp_err);
+    } else {
+        if (!urls) {
+            error("No repository URL set");
+        }
+    }
+
+    // Getting information about variable substitution
+    LrUrlVars *varSubst = NULL;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_VARSUB, &varSubst);
+    if (tmp_err) {
+        printError("Unable to get variable substitution for URL", tmp_err);
+    } else {
+        if (varSubst) {
+            for (LrUrlVars *elem = varSubst; elem; elem = g_slist_next(elem)) {
+                LrVar *var_val = elem->data;
+                if (var_val) {
+                    debug("URL substitution: %s = %s", var_val->var, var_val->val);
+                }
+            }
+        } else {
+            debug("No URL substitution set");
+        }
+    }
+
+    // It is necessary to create copy of list of URL variables to avoid memory leaks
+    // Two handles cannot share same GSList
+    LrUrlVars *newVarSubst = NULL;
+    g_slist_foreach(varSubst, (GFunc)copy_lr_val, &newVarSubst);
+
+    /* Set information on our LrHandle instance.  The LRO_UPDATE option is to tell the LrResult to update the
+     * repo (i.e. download missing information) rather than attempt to replace it.
+     *
+     * FIXME: The internals of this are unclear.  Do we need to create our own LrHandle instance or could we
+     * use the one provided and just modify the download list?  Is reusing the LrResult going to cause
+     * problems?
+     */
+    char *downloadList[] = {"productid", NULL};
+    LrHandle *h = lr_handle_init();
+    lr_handle_setopt(h, NULL, LRO_YUMDLIST, downloadList);
+    lr_handle_setopt(h, NULL, LRO_URLS, urls);
+    lr_handle_setopt(h, NULL, LRO_REPOTYPE, LR_YUMREPO);
+    lr_handle_setopt(h, NULL, LRO_DESTDIR, destdir);
+    lr_handle_setopt(h, NULL, LRO_VARSUB, newVarSubst);
+    lr_handle_setopt(h, NULL, LRO_UPDATE, TRUE);
+
+    if(urls != NULL) {
+        int url_id = 0;
+        do {
+            debug("Downloading metadata from: %s to %s", urls[url_id], destdir);
+            url_id++;
+        } while(urls[url_id] != NULL);
+    }
+    gboolean handleSuccess = lr_handle_perform(h, lrResult, &tmp_err);
+    if (handleSuccess) {
+        LrYumRepo *lrYumRepo = lr_yum_repo_init();
+        if (lrYumRepo != NULL) {
+            lr_result_getinfo(lrResult, &tmp_err, LRR_YUM_REPO, &lrYumRepo);
+            if (tmp_err) {
+                printError("Unable to get information about repository", tmp_err);
+            } else {
+                repoProductId->repo = repo;
+                repoProductId->productIdPath = lr_yum_repo_path(lrYumRepo, "productid");
+                debug("Product id cert downloaded metadata from repo %s to %s",
+                      dnf_repo_get_id(repo),
+                      repoProductId->productIdPath);
+                ret = 1;
+            }
+        } else {
+            error("Unable to initialize LrYumRepo");
+        }
+    } else {
+        printError("Unable to download product certificate", tmp_err);
+    }
+
+    if(urls) {
+        int url_id = 0;
+        do {
+            free(urls[url_id]);
+            url_id++;
+        } while(urls[url_id] != NULL);
+        free(urls);
+        urls = NULL;
+    }
+    lr_handle_free(h);
+    return ret;
+}
+
 /**
  * Try to get content of productid certificate from DnfRepo structure. Note downloading of productid
  * has to be requested during PLUGIN_HOOK_ID_CONTEXT_CONF hook using dnf_repo_add_metadata_type_to_download
@@ -573,26 +677,6 @@ gpointer getProductIdContent(DnfRepo *repo) {
     }
 }
 
-
-int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
-    int ret = 0;
-
-    const gchar *path = dnf_repo_get_filename_md(repo, "productid");
-
-    repoProductId->repo = repo;
-    repoProductId->productIdPath = path;
-    if (path) {
-        debug("Product id cert downloaded metadata from repo %s to %s",
-              dnf_repo_get_id(repo),
-              repoProductId->productIdPath);
-        ret = 1;
-    } else {
-        info("Repository %s does not contain any productid certificate",
-             dnf_repo_get_id(repo));
-    }
-
-    return ret;
-}
 
 /**
  * This function tries to find product id certificate in /etc/pki/product-default.
@@ -647,15 +731,19 @@ int installProductId(RepoProductId *repoProductId, ProductDb *productDb, const c
         return 0;
     }
 
-    if (repoProductId->productIdPath != NULL) {
-        gchar *content = getProductIdContent(repoProductId->repo);
+    const char *productIdPath = repoProductId->productIdPath;
+    gzFile input = gzopen(productIdPath, "r");
 
-        if (content == NULL) {
-            return 0;
-        }
-        GString *pemOutput = g_string_new(content);
-        g_free(content);
+    if (input != NULL) {
+        GString *pemOutput = g_string_new("");
         GString *outname = g_string_new("");
+
+        debug("Decompressing product certificate");
+        int decompressSuccess = decompress(input, pemOutput);
+        if (decompressSuccess == FALSE) {
+            goto out;
+        }
+        debug("Decompressing of certificate finished with status: %d", ret);
         debug("Content of product cert:\n%s", pemOutput->str);
 
         int productIdFound = findProductId(pemOutput, outname);
@@ -686,8 +774,15 @@ int installProductId(RepoProductId *repoProductId, ProductDb *productDb, const c
             }
         }
 
+        out:
         g_string_free(outname, TRUE);
         g_string_free(pemOutput, TRUE);
+    } else {
+        debug("Unable to open compressed product certificate: %s", productIdPath);
+    }
+
+    if(input != NULL) {
+        gzclose(input);
     }
 
     return ret;
@@ -762,4 +857,39 @@ int findProductId(GString *certContent, GString *result) {
     X509_free(x509);
 
     return ret_val;
+}
+
+/**
+ * Decompress product certificate
+ *
+ * @param input This is pointer at input compressed file
+ * @param output Pointer at string, where content of certificate will be stored
+ * @return Return TRUE, when decompression was successful. Otherwise return FALSE.
+ */
+int decompress(gzFile input, GString *output) {
+    // TODO: This method will be useless soon. See: https://bugzilla.redhat.com/show_bug.cgi?id=1640220
+    int ret = TRUE;
+    while (1) {
+        int err;
+        int bytes_read;
+        unsigned char buffer[CHUNK];
+        bytes_read = gzread(input, buffer, CHUNK - 1);
+        buffer[bytes_read] = '\0';
+        g_string_printf(output, "%s", buffer);
+        if (bytes_read < CHUNK - 1) {
+            if (gzeof (input)) {
+                break;
+            }
+            else {
+                const char * error_string;
+                error_string = gzerror(input, & err);
+                if (err) {
+                    error("Decompressing failed with error: %s.", error_string);
+                    ret = FALSE;
+                    break;
+                }
+            }
+        }
+    }
+    return ret;
 }
