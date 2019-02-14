@@ -26,6 +26,8 @@
 #define PRODUCT_CERT_DIR "/etc/pki/product/"
 #define DEFAULT_PRODUCT_CERT_DIR "/etc/pki/product-default/"
 
+#define AVAIL_PKGS_CACHE_FILE "/var/lib/rhsm/cache/package_repo_mapping.json"
+
 #define SUPPORTED_LIBDNF_PLUGIN_API_VERSION 1
 
 #define CHUNK 16384
@@ -58,12 +60,20 @@ typedef struct _PluginHandle {
 
 /**
  * Internal structure for holding information about product-id certificate
- * ins specific repository
+ * in specific repository
  */
 typedef struct {
     DnfRepo *repo;
     const char *productIdPath;
 } RepoProductId;
+
+/**
+ * Internal structure for holding information about packages to repo mapping
+ */
+typedef struct {
+    DnfRepo *repo;
+    GPtrArray *availPackageList;
+} RepoPackages;
 
 RepoProductId *initRepoProductId();
 void freeRepoProductId(RepoProductId *repoProductId);

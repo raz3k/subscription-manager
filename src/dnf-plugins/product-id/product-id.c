@@ -428,6 +428,96 @@ GPtrArray *getInstalledPackages(DnfSack *rpmDbSack) {
 }
 
 /**
+ * Malloc, initialize and return new structure RepoPackages
+ * @return pointer at new structure RepoPackages
+ */
+RepoPackages *initRepoPackages() {
+    RepoPackages *repoPackages = (RepoPackages*)malloc(sizeof(RepoPackages));
+    repoPackages->repo = NULL;
+    repoPackages->availPackageList = NULL;
+    return repoPackages;
+}
+
+int readAvialPkgCache(GError **err) {
+    GFile *dbFile = g_file_new_for_path(AVAIL_PKGS_CACHE_FILE);
+    gchar *fileContents;
+
+    GError *internalErr = NULL;
+    gboolean loadedFileSuccess = g_file_load_contents(dbFile, NULL, &fileContents, NULL, NULL, &internalErr);
+    g_object_unref(dbFile);
+
+    if (!loadedFileSuccess) {
+        *err = g_error_copy(internalErr);
+        g_error_free(internalErr);
+        return 0;
+    }
+
+    json_object *cacheJson = json_tokener_parse(fileContents);
+
+    json_object_put(cacheJson);
+    g_free(fileContents);
+
+    return 1;
+}
+
+/**
+ * Try to write list of packages to cache file (JSON format)
+ * @param repoPackagesMapping pointer at double linked list with repo and list of
+ * @return
+ */
+int writeAvailPkgCache(GList *repoPackagesMapping) {
+    json_object *packagesJson = json_object_new_array();
+
+    GList *iterator;
+    int count = 0;
+    for(iterator = repoPackagesMapping; iterator != NULL; iterator = iterator->next) {
+        RepoPackages *repoPackages = iterator->data;
+        for (guint j = 0; j < repoPackages->availPackageList->len; j++) {
+            json_object *pkgJson = json_object_new_array();
+            DnfPackage *pkg = g_ptr_array_index(repoPackages->availPackageList, j);
+            json_object_array_add(pkgJson, json_object_new_string(dnf_package_get_name(pkg)));
+            json_object_array_add(pkgJson, json_object_new_string(dnf_package_get_arch(pkg)));
+            json_object_array_add(pkgJson, json_object_new_string(dnf_repo_get_id(repoPackages->repo)));
+            json_object_array_add(packagesJson, pkgJson);
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        debug("No package in any repository. Skipping writing cache.");
+        json_object_put(packagesJson);
+        return 0;
+    }
+
+    gchar *packagesJsonString = (gchar *) json_object_to_json_string(packagesJson);
+
+    GFile *cacheFile = g_file_new_for_path(AVAIL_PKGS_CACHE_FILE);
+    GError *internalErr = NULL;
+
+    debug("Writing cache of packages to repository mapping to: %s", AVAIL_PKGS_CACHE_FILE);
+    GFileOutputStream *os = g_file_replace(cacheFile, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &internalErr);
+    if (!internalErr) {
+        gboolean ret;
+        ret = g_output_stream_write_all((GOutputStream *) os, packagesJsonString, strlen(packagesJsonString), NULL, NULL, &internalErr);
+        if (ret == FALSE && internalErr) {
+            printError("Unable to write into /var/lib/rhsm/cache/package_repo_mapping.json file", internalErr);
+        }
+        ret = g_output_stream_close((GOutputStream *) os, NULL, &internalErr);
+        if (ret == FALSE && internalErr) {
+            printError("Unable to close /var/lib/rhsm/cache/package_repo_mapping.json file", internalErr);
+        }
+    } else {
+        printError("Unable to update /var/lib/rhsm/cache/package_repo_mapping.json file", internalErr);
+    }
+
+    json_object_put(packagesJson);
+    g_object_unref(cacheFile);
+    g_object_unref(os);
+
+    return 1;
+}
+
+/**
  * Get list of available package for given repository
  *
  * @param dnfSack pointer at dnf sack
@@ -486,6 +576,7 @@ gboolean isAvailPackageInInstalledPackages(GPtrArray *installedPackages, GPtrArr
  */
 void getActive(DnfPluginHookData *hookData, const GPtrArray *repoAndProductIds, GPtrArray *activeRepoAndProductIds) {
     if (hookData == NULL) {
+        error("Hook data cannot be NULL");
         return;
     }
 
@@ -513,20 +604,42 @@ void getActive(DnfPluginHookData *hookData, const GPtrArray *repoAndProductIds, 
     // Get list of all packages installed in the system
     GPtrArray *installedPackages = getInstalledPackages(rpmDbSack);
     if (installedPackages == NULL) {
+        error("Unable to get list of installed packages in the system");
         return;
     }
+
+    debug("Number of installed packages: %d", installedPackages->len);
+
+    GList *repoPackagesList = NULL;
 
     for (guint i = 0; i < repoAndProductIds->len; i++) {
         RepoProductId *repoProductId = g_ptr_array_index(repoAndProductIds, i);
         GPtrArray *availPackageList = getAvailPackageList(dnfSack, repoProductId->repo);
 
+        debug("Repo %s: contains %d packages", dnf_repo_get_id(repoProductId->repo), availPackageList->len);
+
+        if(availPackageList->len > 0) {
+            RepoPackages *repoPackages = initRepoPackages();
+            repoPackages->repo = repoProductId->repo;
+            repoPackages->availPackageList = availPackageList;
+            repoPackagesList = g_list_append(repoPackagesList, repoPackages);
+        }
+
         gboolean ret = isAvailPackageInInstalledPackages(installedPackages, availPackageList);
         if (ret == TRUE) {
             debug("Repo \"%s\" marked active", dnf_repo_get_id(repoProductId->repo));
             g_ptr_array_add(activeRepoAndProductIds, repoProductId);
+        } else {
+            debug("Repo \"%s\" NOT marked as active (no rpm installed from this repo)",
+                    dnf_repo_get_id(repoProductId->repo));
         }
 
-        g_ptr_array_unref(availPackageList);
+        // g_ptr_array_unref(availPackageList);
+    }
+    debug("Number of active repositories: %d", activeRepoAndProductIds->len);
+
+    if (activeRepoAndProductIds->len > 0) {
+        writeAvailPkgCache(repoPackagesList);
     }
 
     g_ptr_array_unref(installedPackages);
@@ -667,7 +780,7 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
             } else {
                 repoProductId->repo = repo;
                 repoProductId->productIdPath = lr_yum_repo_path(lrYumRepo, "productid");
-                debug("Product id cert downloaded metadata from repo %s to %s",
+                debug("Product id cert downloaded from repo %s to %s",
                       dnf_repo_get_id(repo),
                       repoProductId->productIdPath);
                 ret = 1;
