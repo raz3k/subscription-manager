@@ -347,7 +347,6 @@ int pluginHook(PluginHandle *handle, PluginHookId id, DnfPluginHookData *hookDat
 
         freeProductDb(productDb);
         freeProductDb(oldProductDb);
-        g_ptr_array_unref(repos);
         g_ptr_array_unref(enabledRepos);
         g_ptr_array_unref(disabledRepos);
         g_ptr_array_unref(repoAndProductIds);
@@ -550,6 +549,7 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
     lr_handle_getinfo(lrHandle, &tmp_err, LRI_DESTDIR, &destdir);
     if (tmp_err) {
         printError("Unable to get information about destination folder", tmp_err);
+        tmp_err = NULL;
     } else {
         if (destdir) {
             debug("Destination folder: %s", destdir);
@@ -562,6 +562,7 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
     lr_handle_getinfo(lrHandle, &tmp_err, LRI_URLS, &urls);
     if (tmp_err) {
         printError("Unable to get information about URLs", tmp_err);
+        tmp_err = NULL;
     } else {
         if (!urls) {
             error("No repository URL set");
@@ -573,6 +574,7 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
     lr_handle_getinfo(lrHandle, &tmp_err, LRI_VARSUB, &varSubst);
     if (tmp_err) {
         printError("Unable to get variable substitution for URL", tmp_err);
+        tmp_err = NULL;
     } else {
         if (varSubst) {
             for (LrUrlVars *elem = varSubst; elem; elem = g_slist_next(elem)) {
@@ -583,6 +585,44 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
             }
         } else {
             debug("No URL substitution set");
+        }
+    }
+
+    // Getting information about client key, certificate and CA certificate
+    char *client_key = NULL;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_SSLCLIENTKEY, &client_key);
+    if (tmp_err) {
+        printError("Unable to get information about client key", tmp_err);
+        tmp_err = NULL;
+    } else {
+        if (client_key) {
+            debug("SSL client key: %s", client_key);
+        } else {
+            debug("SSL client key has not been used");
+        }
+    }
+    char *client_cert = NULL;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_SSLCLIENTCERT, &client_cert);
+    if (tmp_err) {
+        printError("Unable to get information about client certificate", tmp_err);
+        tmp_err = NULL;
+    } else {
+        if (client_cert) {
+            debug("SSL client cert: %s", client_cert);
+        } else {
+            debug("SSL client cert has not been used");
+        }
+    }
+    char *ca_cert = NULL;
+    lr_handle_getinfo(lrHandle, &tmp_err, LRI_SSLCACERT, &ca_cert);
+    if (tmp_err) {
+        printError("Unable to get information about CA certificate", tmp_err);
+        tmp_err = NULL;
+    } else {
+        if (client_cert) {
+            debug("SSL CA cert: %s", ca_cert);
+        } else {
+            debug("SSL CA cert has not been used");
         }
     }
 
@@ -605,6 +645,9 @@ int fetchProductId(DnfRepo *repo, RepoProductId *repoProductId) {
     lr_handle_setopt(h, NULL, LRO_REPOTYPE, LR_YUMREPO);
     lr_handle_setopt(h, NULL, LRO_DESTDIR, destdir);
     lr_handle_setopt(h, NULL, LRO_VARSUB, newVarSubst);
+    lr_handle_setopt(h, NULL, LRO_SSLCLIENTKEY, client_key);
+    lr_handle_setopt(h, NULL, LRO_SSLCLIENTCERT, client_cert);
+    lr_handle_setopt(h, NULL, LRO_SSLCACERT, ca_cert);
     lr_handle_setopt(h, NULL, LRO_UPDATE, TRUE);
 
     if(urls != NULL) {
